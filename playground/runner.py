@@ -15,9 +15,9 @@ from brax.training.agents.ppo import networks as ppo_networks
 from brax.training.agents.ppo import train as ppo
 from jax import numpy as jp
 from ml_collections import config_dict
-from zbot import joystick as zbot_joystick
-from zbot import randomize as zbot_randomize
-from zbot import zbot_constants
+from playground.zbot import joystick as zbot_joystick
+from playground.zbot import randomize as zbot_randomize
+from playground.zbot import zbot_constants
 
 from mujoco_playground import wrapper
 from mujoco_playground._src.gait import draw_joystick_command
@@ -39,39 +39,39 @@ class ZBotRunner:
         self.x_data, self.y_data, self.y_dataerr = [], [], []
         self.times = [datetime.now()]
         self.base_body = "Z-BOT2_MASTER-BODY-SKELETON"
-        
+
     def setup_environment(self) -> None:
         """Initialize environment configuration"""
         self.env_config = zbot_joystick.default_config()
         self.env = zbot_joystick.Joystick(task=self.args.task)
         self.eval_env = zbot_joystick.Joystick(task=self.args.task)
         self.randomizer = zbot_randomize.domain_randomize
-        
+
     def setup_training_config(self) -> None:
         """Setup PPO training configuration"""
         self.rl_config = config_dict.create(
-            num_timesteps=5 if self.args.debug else 150_000_000,
-            num_evals=15,
+            num_timesteps=5 if self.args.debug else 200_000_000,
+            num_evals=20,
             reward_scaling=1.0,
             episode_length=1 if self.args.debug else self.env_config.episode_length,
             normalize_observations=True,
             action_repeat=1,
             unroll_length=20,
             num_minibatches=1 if self.args.debug else 32,
-            num_updates_per_batch=1 if self.args.debug else 4,
+            num_updates_per_batch=1 if self.args.debug else 8,
             discounting=0.97,
             learning_rate=3e-4,
-            entropy_cost=0.005,
-            num_envs=1 if self.args.debug else 8192,
-            batch_size=2 if self.args.debug else 256,
+            entropy_cost=0.01,
+            num_envs=1 if self.args.debug else 16384,
+            batch_size=2 if self.args.debug else 512,
             max_grad_norm=1.0,
             clipping_epsilon=0.2,
-            num_resets_per_eval=1
+            num_resets_per_eval=2
         )
-        
+
         self.rl_config.network_factory = config_dict.create(
-            policy_hidden_layer_sizes=(512, 256, 128),
-            value_hidden_layer_sizes=(512, 256, 128),
+            policy_hidden_layer_sizes=(1024, 512, 256),
+            value_hidden_layer_sizes=(1024, 512, 256),
             policy_obs_key="state",
             value_obs_key="privileged_state",
         )
@@ -79,7 +79,7 @@ class ZBotRunner:
 
     def save_video(self, frames: list[np.ndarray], fps: float, filename: str = 'output.mp4') -> None:
         """Save video frames using OpenCV
-        
+
         Args:
             frames (list[np.ndarray]): List of frames to save.
             fps (float): Frames per second.
@@ -88,7 +88,7 @@ class ZBotRunner:
         height, width, _ = frames[0].shape
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(filename, fourcc, fps, (width, height))
-        
+
         for frame in frames:
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             out.write(frame_bgr)
@@ -96,7 +96,7 @@ class ZBotRunner:
 
     def progress_callback(self, num_steps: int, metrics: dict) -> None:
         """Callback function for training progress
-        
+
         Args:
             num_steps (int): Number of steps taken.
             metrics (dict): Metrics from the training process.
@@ -110,7 +110,8 @@ class ZBotRunner:
         plt.xlabel("# environment steps")
         plt.ylabel("reward per episode")
         plt.title(f"y={self.y_data[-1]:.3f}")
-        plt.errorbar(self.x_data, self.y_data, yerr=self.y_dataerr, color="blue")
+        plt.errorbar(self.x_data, self.y_data,
+                     yerr=self.y_dataerr, color="blue")
         plt.savefig('plot.png')
         plt.close()
 
@@ -138,10 +139,10 @@ class ZBotRunner:
             eval_env=self.eval_env,
             wrap_env_fn=wrapper.wrap_for_brax_training,
         )
-        
+
         self.logger.info(f"Time to jit: {self.times[1] - self.times[0]}")
         self.logger.info(f"Time to train: {self.times[-1] - self.times[1]}")
-        
+
         if self.args.save_model:
             self.save_model()
 
@@ -163,11 +164,11 @@ class ZBotRunner:
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def run_step(
-        self, state: jax.Array, rng: jax.Array, 
+        self, state: jax.Array, rng: jax.Array,
         inference_fn: any
     ) -> tuple[jax.Array, jax.Array]:
         """Execute a single environment step with JAX transformation
-        
+
         Args:
             state (jax.Array): Current state.
             rng (jax.Array): Random number generator.
@@ -183,25 +184,27 @@ class ZBotRunner:
         eval_env = zbot_joystick.Joystick(task=self.args.task)
         jit_reset = jax.jit(eval_env.reset)
         jit_step = jax.jit(eval_env.step)
-        jit_inference_fn = jax.jit(self.make_inference_fn(self.params, deterministic=True))
+        jit_inference_fn = jax.jit(
+            self.make_inference_fn(self.params, deterministic=True))
 
         # inference_fn = self.make_inference_fn(self.params, deterministic=True)
         rng = jax.random.PRNGKey(self.args.seed)
-        command = jp.array([self.args.x_vel, self.args.y_vel, self.args.yaw_vel])
+        command = jp.array(
+            [self.args.x_vel, self.args.y_vel, self.args.yaw_vel])
         phase_dt = 2 * jp.pi * self.eval_env.dt * 1.5
         phase = jp.array([0, jp.pi])
-        
+
         for episode in range(self.args.num_episodes):
             self.logger.info(f"Episode {episode}")
             rollout = []
             modify_scene_fns = []
-            
+
             # Initialize episode
             state = jit_reset(jax.random.PRNGKey(1))
             state.info["phase_dt"] = phase_dt
             state.info["phase"] = phase
             state.info["command"] = command
-            
+
             # Run episode
             for _ in range(self.args.episode_length):
                 act_rng, rng = jax.random.split(rng)
@@ -213,11 +216,12 @@ class ZBotRunner:
                 rollout.append(state)
 
                 # Get robot position and orientation
-                xyz = np.array(state.data.xpos[self.eval_env.mj_model.body(zbot_constants.ROOT_BODY).id])
+                xyz = np.array(
+                    state.data.xpos[self.eval_env.mj_model.body(zbot_constants.ROOT_BODY).id])
                 xyz += np.array([0, 0.0, 0])
                 x_axis = state.data.xmat[self.eval_env._torso_body_id, 0]
                 yaw = -np.arctan2(x_axis[1], x_axis[0])
-                
+
                 modify_scene_fns.append(
                     functools.partial(
                         draw_joystick_command,
@@ -227,14 +231,14 @@ class ZBotRunner:
                         scl=np.linalg.norm(state.info["command"]),
                     )
                 )
-            
+
             self.render_episode(rollout, modify_scene_fns, episode)
 
     def render_episode(
         self, rollout: list[jax.Array], modify_scene_fns: list[callable], episode_num: int
     ) -> None:
         """Render and save episode video
-        
+
         Args:
             rollout (list[jax.Array]): Rollout data.
             modify_scene_fns (list[callable]): Modify scene functions.
@@ -243,7 +247,7 @@ class ZBotRunner:
         render_every = 1
         fps = 1.0 / self.eval_env.dt / render_every
         self.logger.info(f"fps: {fps}")
-        
+
         traj = rollout[::render_every]
         mod_fns = modify_scene_fns[::render_every]
 
@@ -268,28 +272,38 @@ class ZBotRunner:
 
 def main():
     parser = argparse.ArgumentParser(description='ZBot Runner Script')
-    parser.add_argument('--env', type=str, default="ZbotJoystickFlatTerrain", help='Environment to run')
-    parser.add_argument('--task', type=str, default="flat_terrain", help='Task to run')
-    parser.add_argument('--debug', action='store_true', help='Run in debug mode with minimal parameters')
-    parser.add_argument('--save-model', action='store_true', help='Save model after training')
-    parser.add_argument('--load-model', action='store_true', help='Load existing model instead of training')
+    parser.add_argument(
+        '--env', type=str, default="ZbotJoystickFlatTerrain", help='Environment to run')
+    parser.add_argument('--task', type=str,
+                        default="flat_terrain", help='Task to run')
+    parser.add_argument('--debug', action='store_true',
+                        help='Run in debug mode with minimal parameters')
+    parser.add_argument('--save-model', action='store_true',
+                        help='Save model after training')
+    parser.add_argument('--load-model', action='store_true',
+                        help='Load existing model instead of training')
     parser.add_argument('--seed', type=int, default=1, help='Random seed')
-    parser.add_argument('--num-episodes', type=int, default=2, help='Number of evaluation episodes')
-    parser.add_argument('--episode-length', type=int, default=3000, help='Length of each episode')
-    parser.add_argument('--x-vel', type=float, default=1.0, help='X velocity command')
-    parser.add_argument('--y-vel', type=float, default=0.0, help='Y velocity command')
-    parser.add_argument('--yaw-vel', type=float, default=0.0, help='Yaw velocity command')
+    parser.add_argument('--num-episodes', type=int, default=2,
+                        help='Number of evaluation episodes')
+    parser.add_argument('--episode-length', type=int,
+                        default=3000, help='Length of each episode')
+    parser.add_argument('--x-vel', type=float, default=1.0,
+                        help='X velocity command')
+    parser.add_argument('--y-vel', type=float, default=0.0,
+                        help='Y velocity command')
+    parser.add_argument('--yaw-vel', type=float,
+                        default=0.0, help='Yaw velocity command')
     args = parser.parse_args()
-    
+
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
     runner = ZBotRunner(args, logger)
-    
+
     if args.load_model:
         runner.load_model()
     else:
         runner.train()
-    
+
     runner.evaluate()
 
 
