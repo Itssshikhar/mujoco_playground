@@ -56,11 +56,23 @@ def create_training_args(task="flat_terrain", load_existing=False):
         save_model=True,
         load_model=load_existing,
         seed=42,
-        num_episodes=3,
-        episode_length=3000,
+        num_episodes=100,
+        episode_length=5000,
         x_vel=1.0,
         y_vel=0.0,
-        yaw_vel=0.0
+        yaw_vel=0.0,
+        curriculum=True,
+        initial_roughness=0.0,
+        final_roughness=1.0,
+        roughness_increment=0.1,
+        min_success_rate=0.7,
+        learning_rate=3e-4,
+        batch_size=256,
+        update_epochs=10,
+        randomize_mass=True,
+        mass_range=(0.8, 1.2),
+        randomize_friction=True,
+        friction_range=(0.8, 1.2)
     )
     return args
 
@@ -198,42 +210,36 @@ def train_flat_terrain():
 # Rough Terrain Training Phase
 ##############################
 
-def train_rough_terrain(flat_terrain_runner):
-    """Adapt the policy to rough terrain"""
+def train_with_curriculum(initial_runner):
+    """Train with progressive terrain difficulty"""
     logger.info("=" * 50)
-    logger.info("Starting rough terrain adaptation phase")
+    logger.info("Starting curriculum training")
     logger.info("=" * 50)
     
-    # Initialize runner with rough terrain config
     args = create_training_args(task="rough_terrain", load_existing=True)
-    logger.info("Training configuration:")
-    for key, value in vars(args).items():
-        logger.info(f"  {key}: {value}")
-    
     runner = ZBotRunner(args, logger)
+    runner.params = initial_runner.params
     
-    # Load flat terrain policy
-    logger.info("Loading pre-trained flat terrain policy...")
-    runner.params = flat_terrain_runner.params
+    current_roughness = args.initial_roughness
     
-    # Continue training on rough terrain
-    logger.info("Beginning rough terrain adaptation...")
-    runner.train()
-    
-    # Log training statistics
-    logger.info("Adaptation completed. Final statistics:")
-    logger.info(f"  Total steps: {len(runner.x_data)}")
-    logger.info(f"  Final reward: {runner.y_data[-1]:.2f} ± {runner.y_dataerr[-1]:.2f}")
-    logger.info(f"  Training time: {(runner.times[-1] - runner.times[0]).total_seconds():.2f}s")
-    
-    # Plot and save results
-    logger.info("Saving training visualizations and metrics...")
-    plot_training_progress(runner, "Rough Terrain Training")
-    save_training_metrics(runner, "rough_terrain_metrics.pkl")
-    
-    # Evaluate policy
-    logger.info("Starting rough terrain policy evaluation...")
-    runner.evaluate()
+    while current_roughness <= args.final_roughness:
+        logger.info(f"Training at roughness level: {current_roughness:.2f}")
+        
+        # Update environment parameters
+        runner.env.set_terrain_roughness(current_roughness)
+        
+        # Train for several episodes at current difficulty
+        success_rate = runner.train_and_evaluate()
+        
+        # Advance curriculum if performance is good enough
+        if success_rate >= args.min_success_rate:
+            current_roughness += args.roughness_increment
+            logger.info(f"Advancing to roughness level: {current_roughness:.2f}")
+        else:
+            logger.info("Performance below threshold, continuing at current level")
+            
+        # Save checkpoint
+        runner.save_checkpoint(f"rough_terrain_r{current_roughness:.2f}.pkl")
     
     return runner
 
@@ -315,7 +321,7 @@ def main():
         
         # Train on rough terrain
         logger.info("Starting rough terrain adaptation phase...")
-        rough_runner = train_rough_terrain(flat_runner)
+        rough_runner = train_with_curriculum(flat_runner)
         
         # Load and analyze results
         logger.info("Loading training metrics for analysis...")
