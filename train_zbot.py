@@ -94,6 +94,50 @@ def save_training_metrics(runner, filename):
     with open(filename, 'wb') as f:
         pickle.dump(metrics, f)
 
+def setup_offscreen_rendering():
+    """Configure environment for offscreen rendering"""
+    import os
+    os.environ['MUJOCO_GL'] = 'egl'  # Use EGL for offscreen rendering
+    # Fallback to software renderer if EGL is not available
+    try:
+        import mujoco
+        _ = mujoco.GLContext(64, 64)  # Test EGL context creation
+    except Exception:
+        logger.info("EGL not available, falling back to osmesa")
+        os.environ['MUJOCO_GL'] = 'osmesa'
+
+def render_episode(runner, episode_frames, episode_num, output_dir="renders"):
+    """Save episode frames as video"""
+    import cv2
+    import numpy as np
+    from pathlib import Path
+
+    # Create output directory if it doesn't exist
+    Path(output_dir).mkdir(exist_ok=True)
+    
+    # Define the output path
+    output_path = f"{output_dir}/episode_{episode_num}.mp4"
+    
+    if not episode_frames:
+        logger.warning("No frames to render")
+        return
+
+    # Get frame dimensions
+    height, width = episode_frames[0].shape[:2]
+    
+    # Initialize video writer
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, 30.0, (width, height))
+    
+    # Write frames
+    for frame in episode_frames:
+        # Convert from RGB to BGR for OpenCV
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        out.write(frame_bgr)
+    
+    out.release()
+    logger.info(f"Saved episode video to {output_path}")
+
 #############################
 # Flat Terrain Training Phase
 #############################
@@ -103,34 +147,51 @@ def train_flat_terrain():
     logger.info("=" * 50)
     logger.info("Starting flat terrain training phase")
     logger.info("=" * 50)
-    
+
+    # Setup offscreen rendering
+    setup_offscreen_rendering()
+
     # Initialize runner with flat terrain config
     args = create_training_args(task="flat_terrain", load_existing=False)
     logger.info("Training configuration:")
     for key, value in vars(args).items():
         logger.info(f"  {key}: {value}")
-    
+
     runner = ZBotRunner(args, logger)
-    
+
     # Train policy
     logger.info("Beginning training loop...")
     runner.train()
-    
+
     # Log training statistics
     logger.info("Training completed. Final statistics:")
     logger.info(f"  Total steps: {len(runner.x_data)}")
     logger.info(f"  Final reward: {runner.y_data[-1]:.2f} ± {runner.y_dataerr[-1]:.2f}")
     logger.info(f"  Training time: {(runner.times[-1] - runner.times[0]).total_seconds():.2f}s")
-    
+
     # Plot and save results
     logger.info("Saving training visualizations and metrics...")
     plot_training_progress(runner, "Flat Terrain Training")
     save_training_metrics(runner, "flat_terrain_metrics.pkl")
-    
-    # Evaluate policy
-    logger.info("Starting flat terrain policy evaluation...")
-    runner.evaluate()
-    
+
+    # Evaluate and render using offscreen rendering
+    try:
+        logger.info("Starting flat terrain policy evaluation with offscreen rendering...")
+        episode_frames = []
+        
+        def frame_callback(frame):
+            episode_frames.append(frame)
+        
+        # Modify the evaluate method to collect frames
+        runner.eval_env.set_render_callback(frame_callback)
+        runner.evaluate()
+        
+        # Save the rendered episode
+        render_episode(runner, episode_frames, episode_num=0)
+        
+    except Exception as e:
+        logger.error(f"Evaluation failed: {str(e)}", exc_info=True)
+
     return runner
 
 ##############################
